@@ -24,7 +24,7 @@ on:
 env:
   # The one variable that separates the arms: on baseline, action-checkout
   # skips its Set up Chalk step entirely.
-  CHALK_ON: ${{ github.event_name == 'workflow_dispatch' && inputs.leg != 'baseline' }}
+  CHALK_ON: ${{ inputs.leg == 'instrumented' }}
   NODE_VERSION: "22"
   PNPM_VERSION: "10.26.2"
 
@@ -43,7 +43,7 @@ jobs:
   auto-format:
     name: Auto-fix Formatting
     runs-on: ubuntu-latest
-    if: github.event_name == 'push'
+    if: ${{ 'push' == 'push' }}
     permissions:
       contents: write
       id-token: write
@@ -198,7 +198,7 @@ jobs:
   # Keeps the real Tauri build coverage off the PR critical path.
   validation-full:
     name: Full Tauri Build (${{ matrix.os }})
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    if: ${{ 'push' == 'push' || 'push' == 'workflow_dispatch' }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
