@@ -48,44 +48,115 @@ jobs:
       contents: write
       id-token: write
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+        token: ${{ secrets.GITHUB_TOKEN }}
+    - name: Setup Development Environment
+      uses: ./.github/actions/setup-env
+      with:
+        mode: node
 
-      - name: Setup Development Environment
-        uses: ./.github/actions/setup-env
-        with:
-          mode: node
+    - name: Auto-fix Prettier formatting
+      run: npx prettier --write . --ignore-unknown --cache
 
-      - name: Auto-fix Prettier formatting
-        run: npx prettier --write . --ignore-unknown --cache
+    - name: Auto-fix Rust formatting
+      run: cargo fmt --all --manifest-path src-tauri/Cargo.toml
 
-      - name: Auto-fix Rust formatting
-        run: cargo fmt --all --manifest-path src-tauri/Cargo.toml
+    - name: Commit formatting fixes
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        git add .
+        if ! git diff --staged --quiet; then
+          git commit -m "Auto-fix formatting issues"
+          git push
+        else
+          echo "No formatting changes to commit"
+        fi
 
-      - name: Commit formatting fixes
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add .
-          if ! git diff --staged --quiet; then
-            git commit -m "Auto-fix formatting issues"
-            git push
-          else
-            echo "No formatting changes to commit"
+
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
           fi
+        done
 
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
 
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   rust-quality:
     name: Rust Code Quality
     runs-on: ubuntu-latest
@@ -97,44 +168,115 @@ jobs:
         shell: bash
         working-directory: src-tauri
     steps:
-      - name: Checkout code
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout code
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup Rust Environment
+      uses: ./.github/actions/setup-env
+      with:
+        mode: build
 
-      - name: Setup Rust Environment
-        uses: ./.github/actions/setup-env
-        with:
-          mode: build
+    - name: Install Rust components
+      shell: bash
+      run: rustup component add rustfmt clippy
 
-      - name: Install Rust components
-        shell: bash
-        run: rustup component add rustfmt clippy
+    - uses: rui314/setup-mold@v1
 
-      - uses: rui314/setup-mold@v1
+    - name: Install cargo-hack
+      uses: taiki-e/install-action@v2
+      with:
+        tool: cargo-hack
 
-      - name: Install cargo-hack
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack
+    - name: Check Rust formatting
+      run: cargo fmt --all -- --color=always --check
 
-      - name: Check Rust formatting
-        run: cargo fmt --all -- --color=always --check
-
-      - name: Run Clippy lints
-        run: cargo hack --feature-powerset --exclude-features cli-build --no-dev-deps clippy # cspell:disable-line
+    - name: Run Clippy lints
+      run: cargo hack --feature-powerset --exclude-features cli-build --no-dev-deps clippy   # cspell:disable-line
 
   # Fast lane: runs on every PR and push. Skips the heavy real Tauri build
   # (kept under tests/index.js) but still covers Vitest + integration suites
   # so feedback stays under ~5 minutes per OS instead of 20+.
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   validation-fast:
     name: CLI Fast Validation (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -143,59 +285,130 @@ jobs:
         os: [ubuntu-latest]
       fail-fast: false
     steps:
-      - name: Checkout repository
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout repository
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup Build Environment
+      uses: ./.github/actions/setup-env
+      with:
+        mode: build
 
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-env
-        with:
-          mode: build
-
-      - name: Build CLI
-        run: pnpm run cli:build
+    - name: Build CLI
+      run: pnpm run cli:build
 
       # dist/cli.js is a tracked build artifact; a bin/ change without the
       # regenerated dist/cli.js ships stale CLI behavior. Linux only to avoid
       # cross-OS line-ending noise.
-      - name: Verify committed dist/cli.js matches bin/ sources
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          if ! git diff --exit-code -- dist/; then
-            echo "::error::dist/cli.js is out of sync with bin/. Run 'pnpm run cli:build' and commit the regenerated dist/cli.js."
-            exit 1
-          fi
+    - name: Verify committed dist/cli.js matches bin/ sources
+      if: runner.os == 'Linux'
+      shell: bash
+      run: |
+        if ! git diff --exit-code -- dist/; then
+          echo "::error::dist/cli.js is out of sync with bin/. Run 'pnpm run cli:build' and commit the regenerated dist/cli.js."
+          exit 1
+        fi
 
-      - name: Run Fast Test Suite
-        shell: bash
-        run: PAKE_CREATE_APP=1 node tests/index.js --no-build
-        timeout-minutes: 15
-        env:
-          CI: true
-          NODE_ENV: test
+    - name: Run Fast Test Suite
+      shell: bash
+      run: PAKE_CREATE_APP=1 node tests/index.js --no-build
+      timeout-minutes: 15
+      env:
+        CI: true
+        NODE_ENV: test
 
-      - name: Test CLI Integration (smoke)
-        shell: bash
-        run: |
-          echo "Testing CLI integration..."
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            timeout 60s PAKE_CREATE_APP=1 node dist/cli.js https://weekly.tw93.fun --name "CITest" --debug --iterative-build || true
-          else
-            timeout 30s PAKE_CREATE_APP=1 node dist/cli.js https://weekly.tw93.fun --name "CITest" --debug --iterative-build || true
-          fi
+    - name: Test CLI Integration (smoke)
+      shell: bash
+      run: |
+        echo "Testing CLI integration..."
+        if [[ "$RUNNER_OS" == "Windows" ]]; then
+          timeout 60s PAKE_CREATE_APP=1 node dist/cli.js https://weekly.tw93.fun --name "CITest" --debug --iterative-build || true
+        else
+          timeout 30s PAKE_CREATE_APP=1 node dist/cli.js https://weekly.tw93.fun --name "CITest" --debug --iterative-build || true
+        fi
 
   # Full lane: only runs after merge to main (push event) or manual dispatch.
   # Keeps the real Tauri build coverage off the PR critical path.
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
+
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   validation-full:
     name: Full Tauri Build (${{ matrix.os }})
     if: ${{ 'push' == 'push' || 'push' == 'workflow_dispatch' }}
@@ -205,46 +418,117 @@ jobs:
         os: [ubuntu-latest]
       fail-fast: false
     steps:
-      - name: Checkout repository
-        uses: crashappsec/action-checkout@main
-        with:
-          chalk: ${{ env.CHALK_ON }}
-          profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
-          observables_continue_on_error: false
-          lfs: false
-      - name: Assert instrumentation is live
-        if: env.CHALK_ON == 'true'
-        run: |
-          test -n "${CURIOSITY_ROOT:-}" || { echo "::error::CURIOSITY_ROOT unset - observables never installed"; exit 1; }
-          test -S "${CURIOSITY_SOCKET_NAME:?socket name unset}" || { echo "::error::co-hostd socket absent"; exit 1; }
+    - name: Checkout repository
+      uses: crashappsec/action-checkout@main
+      with:
+        chalk: ${{ env.CHALK_ON }}
+        profile: ${{ inputs.profile || 'curiosity-tests-racecar' }}
+        observables_continue_on_error: false
+        lfs: false
+    - name: Setup Build Environment
+      uses: ./.github/actions/setup-env
+      with:
+        mode: build
 
-      - name: Setup Build Environment
-        uses: ./.github/actions/setup-env
-        with:
-          mode: build
+    - name: Run Full Test Suite (with real build)
+      run: pnpm test
+      timeout-minutes: 30
+      env:
+        CI: true
+        NODE_ENV: test
 
-      - name: Run Full Test Suite (with real build)
-        run: pnpm test
-        timeout-minutes: 30
-        env:
-          CI: true
-          NODE_ENV: test
+    - name: Check observables and crashes
+      if: always() && env.CHALK_ON == 'true'
+      shell: bash
+      run: |
+        set -uo pipefail
+        root="${CURIOSITY_ROOT:-}"
+        home="${CURIOSITY_HOME:-/mnt/curiosity}"
+        obs="${home}/observables"
+        fail=0
 
+        echo "::group::curiosity layout"
+        echo "CURIOSITY_ROOT=${root:-<unset>}"
+        echo "CURIOSITY_HOME=${home}"
+        ls -la "${obs}" 2>/dev/null || echo "no observables dir at ${obs}"
+        echo "::endgroup::"
+
+        # Observables for THIS run+attempt. The prefix matters: a stale file from an
+        # earlier run on the same mount would otherwise pass.
+        prefix="${GITHUB_RUN_ID}_${GITHUB_RUN_ATTEMPT}"
+        shopt -s nullglob
+        mine=("${obs}/${prefix}"*)
+        if [ ${#mine[@]} -eq 0 ]; then
+          mine=("${obs}/${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-observables"*)
+        fi
+        if [ ${#mine[@]} -eq 0 ]; then
+          echo "::error::no observables for run ${prefix} in ${obs} - instrumentation produced nothing"
+          fail=1
+        else
+          echo "observables present: ${#mine[@]} file(s)"
+          printf '  %s\n' "${mine[@]}"
+        fi
+
+        for f in "${mine[@]}"; do
+          case "$f" in
+            *.jsonl|*.json|*.combined)
+              if ! jq --slurp "." "$f" > /dev/null 2>&1; then
+                echo "::error::observables do not parse: $f"
+                fail=1
+              fi
+              ;;
+          esac
+        done
+
+        # Crash thresholds copied from check-run: a few null frames are noise, more than
+        # five is a stack walk into nothing.
+        for f in "${root}"/log/co-host*.log "${home}"/log/co-host*.log; do
+          [ -f "$f" ] || continue
+          echo "Asserting that there is no crash in $f"
+          if [ "$(grep -c 'p 00000000' "$f" 2>/dev/null || echo 0)" -gt 5 ] \
+            || [ "$(grep -E -c 'FATAL: Uncaught signal|Address not mapped at|RAX 0x.*RBX 0x' "$f" 2>/dev/null || echo 0)" -gt 1 ]; then
+            echo "::error::crash signature in $f"
+            grep -E 'FATAL: Uncaught signal|Address not mapped at' "$f" | head -5 || true
+            fail=1
+          fi
+        done
+
+        cores=("${root}"/coredump.* "${home}"/coredump.*)
+        if [ ${#cores[@]} -gt 0 ]; then
+          echo "::error::coredump present: ${cores[*]}"
+          fail=1
+        fi
+
+        for f in "${root}"/runc.log "${root}"/runc.global.log \
+                 "${home}"/runc.log "${home}"/runc.global.log; do
+          [ -f "$f" ] || continue
+          if grep -q '^E:' "$f"; then
+            echo "::error::error in $f"
+            grep '^E:' "$f" | head -5
+            fail=1
+          fi
+        done
+
+        if [ "$fail" -ne 0 ]; then
+          echo "::error::instrumentation check FAILED"
+          exit 1
+        fi
+        echo "instrumentation check passed"
   summary:
     name: Quality Summary
     runs-on: ubuntu-latest
     needs: [auto-format, rust-quality, validation-fast, validation-full]
     if: always()
     steps:
-      - name: Generate Summary
-        run: |
-          {
-            echo "# Quality & Testing Summary"
-            echo ""
-            echo "| Check | Status |"
-            echo "|-------|--------|"
-            echo "| Auto Formatting | ${{ needs.auto-format.result == 'success' && 'PASSED' || needs.auto-format.result == 'skipped' && 'SKIPPED' || 'FAILED' }} |"
-            echo "| Rust Quality | ${{ needs.rust-quality.result == 'success' && 'PASSED' || 'FAILED' }} |"
-            echo "| CLI Fast Validation | ${{ needs.validation-fast.result == 'success' && 'PASSED' || 'FAILED' }} |"
-            echo "| Full Tauri Build | ${{ needs.validation-full.result == 'success' && 'PASSED' || needs.validation-full.result == 'skipped' && 'SKIPPED (PR fast lane)' || 'FAILED' }} |"
-          } >> $GITHUB_STEP_SUMMARY
+    - name: Generate Summary
+      run: |
+        {
+          echo "# Quality & Testing Summary"
+          echo ""
+          echo "| Check | Status |"
+          echo "|-------|--------|"
+          echo "| Auto Formatting | ${{ needs.auto-format.result == 'success' && 'PASSED' || needs.auto-format.result == 'skipped' && 'SKIPPED' || 'FAILED' }} |"
+          echo "| Rust Quality | ${{ needs.rust-quality.result == 'success' && 'PASSED' || 'FAILED' }} |"
+          echo "| CLI Fast Validation | ${{ needs.validation-fast.result == 'success' && 'PASSED' || 'FAILED' }} |"
+          echo "| Full Tauri Build | ${{ needs.validation-full.result == 'success' && 'PASSED' || needs.validation-full.result == 'skipped' && 'SKIPPED (PR fast lane)' || 'FAILED' }} |"
+        } >> $GITHUB_STEP_SUMMARY
